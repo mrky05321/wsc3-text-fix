@@ -2,9 +2,8 @@
 from __future__ import annotations
 
 import ctypes as C
-from datetime import datetime, timezone
 import hashlib
-import json
+import os
 from pathlib import Path
 import subprocess
 import sys
@@ -17,7 +16,8 @@ from process_patch import (attach_game, process_list, CodeNotReady, GAME_SHA256,
 
 HOME = Path(sys.executable).resolve().parent if getattr(sys, 'frozen', False) else Path(__file__).resolve().parents[1]
 GAME = HOME / 'wsc3.exe'
-LOG_DIR = HOME / 'wsc3_launcher_logs'
+INSTALL_KEY = hashlib.sha256(str(HOME).casefold().encode('utf-8')).hexdigest()[:24]
+STATE_DIR = Path(os.environ.get('LOCALAPPDATA') or (Path.home()/'AppData'/'Local')) / 'wsc3-text-fix' / INSTALL_KEY
 STARTUP_TIMEOUT = 180
 
 
@@ -26,30 +26,6 @@ def notify(message):
     box.argtypes = [C.c_void_p, C.c_wchar_p, C.c_wchar_p, C.c_uint]
     box.restype = C.c_int
     box(None, str(message), 'WSC3 自動改行補正ランチャー', 0x10)
-
-
-class Log:
-    def __init__(self):
-        LOG_DIR.mkdir(parents=True, exist_ok=True)
-        self.path = LOG_DIR / (datetime.now().strftime('%Y%m%d_%H%M%S_%f') + '.jsonl')
-        self.stream = self.path.open('a', encoding='utf-8')
-        self.failed = False
-
-    def write(self, event, **fields):
-        try:
-            self.stream.write(json.dumps({'event': event,
-                'time': datetime.now(timezone.utc).isoformat(timespec='milliseconds'),
-                **fields}, ensure_ascii=False) + '\n')
-            self.stream.flush()
-        except OSError:
-            # A disk failure must not interrupt restoration of the game code.
-            self.failed = True
-
-    def close(self):
-        try:
-            self.stream.close()
-        except OSError:
-            pass
 
 
 def matching_games():
@@ -63,7 +39,7 @@ def matching_games():
     return found
 
 
-def launch(log):
+def launch():
     if not GAME.is_file():
         raise RuntimeError('WSC3Launcher.exeを元のwsc3.exeと同じフォルダに置いてください。')
     if sha_file(GAME) != GAME_SHA256:
@@ -71,14 +47,11 @@ def launch(log):
     candidates = matching_games()
     if len(candidates) > 1:
         raise RuntimeError('同じフォルダのWSC3が複数起動しています。1つにしてから再実行してください。')
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
     started = time.monotonic()
     bootstrap = None
     if not candidates:
         bootstrap = subprocess.Popen([str(GAME), *sys.argv[1:]], cwd=str(HOME))
-        log.write('game_launched', pid=bootstrap.pid, game=str(GAME))
-    else:
-        log.write('existing_game_found', pid=candidates[0]['pid'])
-    seen_pid = None
     absent_since = None
     while time.monotonic() - started < STARTUP_TIMEOUT:
         candidates = matching_games()
@@ -87,14 +60,8 @@ def launch(log):
         if candidates:
             absent_since = None
             pid = candidates[0]['pid']
-            if pid != seen_pid:
-                log.write('waiting_for_render_code', pid=pid)
-                seen_pid = pid
             try:
-                session = attach_game(pid, LOG_DIR, 1)
-                log.write('correction_attached', pid=pid, recovered=session.recovered,
-                          protocol_version=3, policy='M == 2*height -> height+1')
-                return session
+                return attach_game(pid, STATE_DIR, 1)
             except CodeNotReady:
                 pass
             except psutil.NoSuchProcess:
@@ -115,62 +82,41 @@ def launch(log):
     raise RuntimeError('3分以内に対応する描画コードを確認できませんでした。補正は未適用です。')
 
 
-def monitor(session, log):
-    last_stats = None
-    last_saved = 0.0
+def monitor(session):
     while session.process.alive:
-        stats = session.poll()
-        if stats['exited']:
-            break
-        summary = {key: stats[key] for key in ('total', 'fixes', 'lost', 'mode')}
-        now = time.monotonic()
-        if summary != last_stats and (last_stats is None or now-last_saved >= 10):
-            log.write('statistics', **summary)
-            last_stats = summary
-            last_saved = now
-        time.sleep(0.25)
-    log.write('game_exited', last_saved_statistics=last_stats)
+        time.sleep(0.5)
 
 
 def main():
     mutex = None
     session = None
-    log = None
     try:
         # Singleton belongs to this installation, independent of the hook mutex.
-        key = hashlib.sha256(str(HOME).casefold().encode('utf-8')).hexdigest()[:24]
         C.set_last_error(0)
-        mutex = create_mutex(None, False, 'Local\\WSC3Launcher_' + key)
+        mutex = create_mutex(None, False, 'Local\\WSC3Launcher_' + INSTALL_KEY)
         error = C.get_last_error()
         if not mutex:
             raise C.WinError(error)
         if error == 183:
             return  # An existing launcher already owns this game's lifecycle.
-        log = Log()
-        log.write('launcher_started', game=str(GAME))
-        session = launch(log)
-        monitor(session, log)
+        session = launch()
+        monitor(session)
     except Exception as exc:
-        if log:
-            log.write('error', message=str(exc))
-        notify(str(exc) + '\n\n通常の補正操作は手動版WSC3Linewrap.exeでも行えます。')
+        notify(str(exc) + '\n\n元のwsc3.exeファイルは変更していません。')
     finally:
         if session:
             try:
                 session.detach()
-                if log:
-                    log.write('session_closed')
+                try:
+                    session.journal.unlink(missing_ok=True)
+                except OSError:
+                    pass
             except Exception as exc:
-                if log:
-                    log.write('detach_failed', message=str(exc))
                 if session.process.alive:
                     notify('元の命令への復元を確認できませんでした。ゲームを終了してください。\nゲーム終了までランチャーは待機します。\n' + str(exc))
                     while session.process.alive:
                         time.sleep(0.5)
                 session.process.close()
-        if log:
-            log.write('launcher_exited', log_write_failed=log.failed)
-            log.close()
         if mutex:
             close(mutex)
 
