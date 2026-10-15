@@ -1,0 +1,56 @@
+name: Build and release
+
+on:
+  push:
+    branches: [main]
+    paths: [VERSION, .github/workflows/release.yml]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: windows-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+          architecture: x64
+      - name: Install build dependencies
+        run: python -m pip install -r requirements-build.txt
+      - name: Build executable and ZIP
+        run: python build.py
+      - name: Create release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          $version = (Get-Content VERSION -Raw).Trim()
+          $tag = "v$version"
+          $archive = "release/wsc3-text-fix-$tag-win64.zip"
+          $info = Get-Content release/build_info.json -Raw | ConvertFrom-Json
+          $notes = @"
+          鋼鉄の咆哮3 Windows版の文章折り返しを補正する非公式ランチャーです。
+
+          ZIPには WSC3Launcher.exe だけが入っています。元の wsc3.exe と同じフォルダへ置き、ランチャーから起動してください。依存ライブラリのライセンスはEXEに同梱しています。
+
+          Windows 10/11 x64向け、対応ゲームは32bitです。対応バージョンと詳細はREADMEを参照してください。全体補正で改善報告がありますが、このビルドではゲームを起動するテストは実施していません。
+
+          EXE SHA-256: $($info.exe_sha256)
+          ZIP SHA-256: $($info.zip_sha256)
+          "@
+          [System.IO.File]::WriteAllText("release/notes.md", $notes, [System.Text.UTF8Encoding]::new($false))
+          gh release view $tag *> $null
+          if ($LASTEXITCODE -eq 0) {
+            throw "Release $tag already exists. Increment VERSION to publish a new build."
+          }
+          gh release create $tag $archive --target $env:GITHUB_SHA --title "wsc3-text-fix $tag" --notes-file release/notes.md
+          if ($LASTEXITCODE -ne 0) { throw "Release upload failed." }

@@ -1,0 +1,17 @@
+__pycache__/
+*.py[cod]
+.venv/
+build/
+dist/
+release/
+*.spec
+*.exe
+*.dll
+*.zip
+*.dmp
+*.bb3
+*.jsonl
+*.csv
+logs/
+wsc3_launcher_logs/
+hook_*.json

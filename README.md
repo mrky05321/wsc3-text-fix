@@ -6,7 +6,7 @@
 
 ## ダウンロード・使い方
 
-1. [Releases](../../releases) から `wsc3-text-fix-v0.1.0-win64.zip` をダウンロードします。
+1. [Releases](https://github.com/mrky05321/wsc3-text-fix/releases) から `wsc3-text-fix-v0.1.0-win64.zip` をダウンロードします。
 2. ZIP内の **WSC3Launcher.exe** を、元の **wsc3.exeと同じフォルダ**へ置きます。
 3. 今後は **WSC3Launcher.exe** からゲームを起動します。
 
