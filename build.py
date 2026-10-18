@@ -36,8 +36,8 @@ with zipfile.ZipFile(archive,'w',zipfile.ZIP_DEFLATED) as output:
     output.write(exe,'WSC3Launcher.exe')
 info={'version':version,'exe_sha256':hashlib.sha256(exe.read_bytes()).hexdigest(),
       'zip_sha256':hashlib.sha256(archive.read_bytes()).hexdigest(),
-      'zip_contents':['WSC3Launcher.exe'],'runtime_hook_enabled':False,
-      'linewrap_correction_enabled':False,'startup_only':True,
+      'zip_contents':['WSC3Launcher.exe'],'hook_protocol_version':3,
+      'linewrap_correction_enabled':True,'waits_for_responsive_window':True,
       'game_runtime_verified_by_this_build':False}
 (ROOT/'release'/'build_info.json').write_text(json.dumps(info,indent=2),encoding='utf-8')
 print(json.dumps(info,indent=2))

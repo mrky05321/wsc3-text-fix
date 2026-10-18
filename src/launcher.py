@@ -1,52 +1,134 @@
-"""Temporary startup-only launcher. No runtime hooks or thread suspension."""
+"""Windowless game launcher using the already deployed version 3 correction."""
 from __future__ import annotations
+
 import ctypes as C
 import hashlib
+import os
 from pathlib import Path
 import subprocess
 import sys
+import time
 
-HOME=Path(sys.executable).resolve().parent if getattr(sys,'frozen',False) else Path(__file__).resolve().parents[1]
-GAME=HOME/'wsc3.exe'
-GAME_SHA256='9a2a92e473e825b51a9d5bf657d84890e6d96ae3e586c8a5ce15c15514c3f4fc'
+import psutil
+
+from process_patch import (attach_game, process_list, CodeNotReady, GAME_SHA256,
+                           sha_file, create_mutex, close)
+from startup_ready import ready_window, WindowReadyGate
+
+HOME = Path(sys.executable).resolve().parent if getattr(sys, 'frozen', False) else Path(__file__).resolve().parents[1]
+GAME = HOME / 'wsc3.exe'
+INSTALL_KEY = hashlib.sha256(str(HOME).casefold().encode('utf-8')).hexdigest()[:24]
+STATE_DIR = Path(os.environ.get('LOCALAPPDATA') or (Path.home()/'AppData'/'Local')) / 'wsc3-text-fix' / INSTALL_KEY
+STARTUP_TIMEOUT = 180
 
 
-def validate_game():
+def notify(message):
+    box = C.windll.user32.MessageBoxW
+    box.argtypes = [C.c_void_p, C.c_wchar_p, C.c_wchar_p, C.c_uint]
+    box.restype = C.c_int
+    box(None, str(message), 'WSC3 自動改行補正ランチャー', 0x10)
+
+
+def matching_games():
+    found = []
+    for item in process_list():
+        try:
+            if item['path'] and Path(item['path']).resolve() == GAME:
+                found.append(item)
+        except OSError:
+            continue
+    return found
+
+
+def launch():
     if not GAME.is_file():
         raise RuntimeError('WSC3Launcher.exeを元のwsc3.exeと同じフォルダに置いてください。')
-    digest=hashlib.sha256()
-    with GAME.open('rb') as source:
-        for block in iter(lambda:source.read(4*1024*1024),b''):
-            digest.update(block)
-    if digest.hexdigest()!=GAME_SHA256:
+    if sha_file(GAME) != GAME_SHA256:
         raise RuntimeError('対応するwsc3.exeのSHA-256と一致しません。ゲームは起動していません。')
+    candidates = matching_games()
+    if len(candidates) > 1:
+        raise RuntimeError('同じフォルダのWSC3が複数起動しています。1つにしてから再実行してください。')
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    started = time.monotonic()
+    bootstrap = None
+    if not candidates:
+        bootstrap = subprocess.Popen([str(GAME), *sys.argv[1:]], cwd=str(HOME))
+    absent_since = None
+    gate = WindowReadyGate()
+    while time.monotonic() - started < STARTUP_TIMEOUT:
+        candidates = matching_games()
+        if len(candidates) > 1:
+            raise RuntimeError('起動中のWSC3が複数になったため、自動補正を中止しました。')
+        if candidates:
+            absent_since = None
+            pid = candidates[0]['pid']
+            if not gate.update(pid,ready_window(pid),time.monotonic()):
+                time.sleep(0.2)
+                continue
+            try:
+                return attach_game(pid, STATE_DIR, 1)
+            except CodeNotReady:
+                pass
+            except psutil.NoSuchProcess:
+                pass  # Startup may replace its own process; identify the new PID.
+            except (OSError, psutil.AccessDenied) as exc:
+                if not psutil.pid_exists(pid):
+                    continue
+                raise RuntimeError('ゲームへ接続できません。旧補正ソフトを解除し、ゲームと同じ権限で起動してください。\n' + str(exc)) from exc
+        elif bootstrap is not None and bootstrap.poll() is not None:
+            gate.update(None,None,time.monotonic())
+            # Allow the original startup process to hand off to the actual game.
+            if absent_since is None:
+                absent_since = time.monotonic()
+            if time.monotonic() - absent_since > 10:
+                raise RuntimeError('ゲームが終了したため、描画コードに接続できませんでした。ゲーム本体が正常起動できるか確認してください。')
+        elif bootstrap is None:
+            raise RuntimeError('接続待ちの間にゲームが終了しました。')
+        time.sleep(0.2)
+    raise RuntimeError('3分以内に応答するゲーム画面と描画コードを確認できませんでした。補正は未適用です。')
 
 
-def launch(arguments):
-    validate_game()
-    # No scan, memory access, patching, suspension, or exit-time detach.
-    return subprocess.Popen([str(GAME),*arguments],cwd=str(HOME),close_fds=True)
+def monitor(session):
+    while session.process.alive:
+        time.sleep(0.5)
 
 
-def main(arguments=None):
-    arguments=list(sys.argv[1:] if arguments is None else arguments)
-    if arguments==['--check']:
-        # File validation only: never start a process or show a dialog.
-        try:
-            validate_game()
-            return 0
-        except (OSError,RuntimeError):
-            return 2
+def main():
+    if sys.argv[1:]==['--check']:
+        # File-only packaging check; never start or attach to the game.
+        return 0 if GAME.is_file() and sha_file(GAME)==GAME_SHA256 else 2
+    mutex = None
+    session = None
     try:
-        launch(arguments)
-        return 0
+        # Singleton belongs to this installation, independent of the hook mutex.
+        C.set_last_error(0)
+        mutex = create_mutex(None, False, 'Local\\WSC3Launcher_' + INSTALL_KEY)
+        error = C.get_last_error()
+        if not mutex:
+            raise C.WinError(error)
+        if error == 183:
+            return  # An existing launcher already owns this game's lifecycle.
+        session = launch()
+        monitor(session)
     except Exception as exc:
-        box=C.windll.user32.MessageBoxW
-        box.argtypes=[C.c_void_p,C.c_wchar_p,C.c_wchar_p,C.c_uint]
-        box.restype=C.c_int
-        box(None,str(exc),'WSC3 起動専用ランチャー（改行補正は一時停止）',0x10)
-        return 1
+        notify(str(exc) + '\n\n元のwsc3.exeファイルは変更していません。')
+    finally:
+        if session:
+            try:
+                session.detach()
+                try:
+                    session.journal.unlink(missing_ok=True)
+                except OSError:
+                    pass
+            except Exception as exc:
+                if session.process.alive:
+                    notify('元の命令への復元を確認できませんでした。ゲームを終了してください。\nゲーム終了までランチャーは待機します。\n' + str(exc))
+                    while session.process.alive:
+                        time.sleep(0.5)
+                session.process.close()
+        if mutex:
+            close(mutex)
 
 
-if __name__=='__main__':
+if __name__ == '__main__':
     raise SystemExit(main())
