@@ -29,5 +29,7 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.10'
-      - name: Run pure Python unit tests
+      - name: Install runtime dependency for optional Windows API tests
+        run: python -m pip install psutil==7.0.0
+      - name: Run regression tests
         run: python -m unittest discover -s tests -p 'test_*.py' -v
