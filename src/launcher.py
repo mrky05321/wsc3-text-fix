@@ -1,4 +1,4 @@
-"""Windowless game launcher using the already deployed version 3 correction."""
+"""Windowless game launcher using the correction-only version 5 hook."""
 from __future__ import annotations
 
 import ctypes as C

@@ -42,8 +42,8 @@ info={'version':version,'exe_sha256':hashlib.sha256(exe.read_bytes()).hexdigest(
       'pyinstaller_version':packager_version,
       'pyinstaller_hooks_version':metadata.version('pyinstaller-hooks-contrib'),
       'zip_sha256':hashlib.sha256(archive.read_bytes()).hexdigest(),
-      'zip_contents':['WSC3Launcher.exe'],'hook_protocol_version':3,
-      'linewrap_correction_enabled':True,'waits_for_responsive_window':True,
+      'zip_contents':['WSC3Launcher.exe'],'hook_protocol_version':5,
+      'runtime_recording_enabled':False,'linewrap_correction_enabled':True,'waits_for_responsive_window':True,
       'game_runtime_verified_by_this_build':False}
 (ROOT/'release'/'build_info.json').write_text(json.dumps(info,indent=2),encoding='utf-8')
 print(json.dumps(info,indent=2))

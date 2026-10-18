@@ -148,7 +148,7 @@ class SessionTests(unittest.TestCase):
         self.install()
         record=json.loads(self.path.read_text())
         for change in ({'pid':9999},{'creation':float('nan')},{'code':SITE},
-                       {'version':VERSION-1}):
+                       {'version':3},{'version':VERSION-1}):
             self.path.write_text(json.dumps({**record,**change}))
             recovered=p.Session(self.proc,SITE,VTABLE,self.path)
             with patch.object(self.proc,'read',wraps=self.proc.read) as reads:
