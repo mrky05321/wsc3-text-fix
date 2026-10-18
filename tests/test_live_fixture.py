@@ -56,6 +56,19 @@ class LiveFixtureTests(unittest.TestCase):
                 self.assertEqual(evaluate(12,24),24)
                 # Simulate losing the controller without closing the child.
                 session.process.close()
+                original_journal=journal.read_bytes()
+                corrupt=json.loads(original_journal)
+                corrupt['creation']=float('nan')
+                journal.write_text(json.dumps(corrupt),encoding='utf-8')
+                rejected=patcher.Process(child.pid)
+                try:
+                    with self.assertRaises(RuntimeError):
+                        patcher.Session(rejected,target['site'],target['vtable'],journal).install(1)
+                finally:
+                    rejected.close()
+                # Corrupt metadata must leave the already installed hook alone.
+                self.assertEqual(evaluate(12,24),24)  # mode OFF before disconnect
+                journal.write_bytes(original_journal)
                 session=patcher.Session(patcher.Process(child.pid),target['site'],target['vtable'],journal)
                 session.install(1)
                 self.assertTrue(session.recovered)
