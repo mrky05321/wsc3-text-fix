@@ -13,6 +13,7 @@ import psutil
 
 from process_patch import (attach_game, process_list, CodeNotReady, GAME_SHA256,
                            sha_file, create_mutex, close)
+from startup_ready import ready_window, WindowReadyGate
 
 HOME = Path(sys.executable).resolve().parent if getattr(sys, 'frozen', False) else Path(__file__).resolve().parents[1]
 GAME = HOME / 'wsc3.exe'
@@ -53,6 +54,7 @@ def launch():
     if not candidates:
         bootstrap = subprocess.Popen([str(GAME), *sys.argv[1:]], cwd=str(HOME))
     absent_since = None
+    gate = WindowReadyGate()
     while time.monotonic() - started < STARTUP_TIMEOUT:
         candidates = matching_games()
         if len(candidates) > 1:
@@ -60,6 +62,9 @@ def launch():
         if candidates:
             absent_since = None
             pid = candidates[0]['pid']
+            if not gate.update(pid,ready_window(pid),time.monotonic()):
+                time.sleep(0.2)
+                continue
             try:
                 return attach_game(pid, STATE_DIR, 1)
             except CodeNotReady:
@@ -71,6 +76,7 @@ def launch():
                     continue
                 raise RuntimeError('ゲームへ接続できません。旧補正ソフトを解除し、ゲームと同じ権限で起動してください。\n' + str(exc)) from exc
         elif bootstrap is not None and bootstrap.poll() is not None:
+            gate.update(None,None,time.monotonic())
             # Allow the original startup process to hand off to the actual game.
             if absent_since is None:
                 absent_since = time.monotonic()
@@ -79,7 +85,7 @@ def launch():
         elif bootstrap is None:
             raise RuntimeError('接続待ちの間にゲームが終了しました。')
         time.sleep(0.2)
-    raise RuntimeError('3分以内に対応する描画コードを確認できませんでした。補正は未適用です。')
+    raise RuntimeError('3分以内に応答するゲーム画面と描画コードを確認できませんでした。補正は未適用です。')
 
 
 def monitor(session):
@@ -88,6 +94,9 @@ def monitor(session):
 
 
 def main():
+    if sys.argv[1:]==['--check']:
+        # File-only packaging check; never start or attach to the game.
+        return 0 if GAME.is_file() and sha_file(GAME)==GAME_SHA256 else 2
     mutex = None
     session = None
     try:
@@ -104,22 +113,34 @@ def main():
     except Exception as exc:
         notify(str(exc) + '\n\n元のwsc3.exeファイルは変更していません。')
     finally:
-        if session:
-            try:
-                session.detach()
+        try:
+            if session:
                 try:
-                    session.journal.unlink(missing_ok=True)
-                except OSError:
-                    pass
-            except Exception as exc:
-                if session.process.alive:
-                    notify('元の命令への復元を確認できませんでした。ゲームを終了してください。\nゲーム終了までランチャーは待機します。\n' + str(exc))
-                    while session.process.alive:
-                        time.sleep(0.5)
-                session.process.close()
-        if mutex:
-            close(mutex)
+                    session.detach()
+                    try:
+                        session.journal.unlink(missing_ok=True)
+                    except OSError:
+                        pass
+                except Exception as exc:
+                    try:
+                        alive=session.process.alive
+                    except OSError:
+                        alive=None  # Unknown status must never mean exited.
+                    try:
+                        if alive is not False:
+                            notify('元の命令への復元を確認できませんでした。ゲームを終了してください。\n' + str(exc))
+                        while alive:
+                            time.sleep(0.5)
+                            try:
+                                alive=session.process.alive
+                            except OSError:
+                                break
+                    finally:
+                        session.process.close()
+        finally:
+            if mutex:
+                close(mutex)
 
 
 if __name__ == '__main__':
-    main()
+    raise SystemExit(main())
