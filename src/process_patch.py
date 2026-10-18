@@ -185,12 +185,28 @@ class Process:
         return old.value
 
     def code_write(self,address,raw):
+        # The caller freezes all target threads. Keep the exact previous bytes
+        # so a failed/partial write can be rolled back before threads resume.
+        before=self.read(address,len(raw))
         old=self.protect(address,len(raw),PAGE_RWX)
         try:
-            self.write(address,raw)
-            check(flush_cache(self.handle,address,len(raw)),'FlushInstructionCache')
-            if self.read(address,len(raw))!=raw:
-                raise RuntimeError('コードの書込後照合に失敗しました。')
+            try:
+                self.write(address,raw)
+                check(flush_cache(self.handle,address,len(raw)),'FlushInstructionCache')
+                if self.read(address,len(raw))!=raw:
+                    raise RuntimeError('コードの書込後照合に失敗しました。')
+            except Exception:
+                try:
+                    self.write(address,before)
+                    check(flush_cache(self.handle,address,len(before)),'Rollback FlushInstructionCache')
+                    if self.read(address,len(before))!=before:
+                        raise RuntimeError('元のコードへの復元後照合に失敗しました。')
+                except Exception as rollback_error:
+                    raise RuntimeError(
+                        'コードの書込に失敗し、元の命令への復元を確認できません。'
+                        '対象ゲームを終了してください。'
+                    ) from rollback_error
+                raise
         finally:
             self.protect(address,len(raw),old)
 
