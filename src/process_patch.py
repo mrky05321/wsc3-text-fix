@@ -21,6 +21,7 @@ from hook_code import (MAGIC, VERSION, HEADER_SIZE, CAPACITY, RECORD_SIZE, DATA_
                        MODE_OFFSET, COUNTER_OFFSET, ORIGINAL, SITE_RVA, VTABLE_RVA,
                        build_hook, make_header, make_jump, decode_record)
 from journal_validation import load_recovery_journal
+from safety_hold import require_runtime_approval
 
 K = C.WinDLL('kernel32', use_last_error=True)
 INVALID = C.c_void_p(-1).value
@@ -503,6 +504,7 @@ class Session:
 
 
 def attach_game(pid,log_dir,mode=0,*,capture=True):
+    require_runtime_approval()
     proc=psutil.Process(pid)
     path=proc.exe()
     if Path(path).name.lower()!='wsc3.exe' or sha_file(path)!=GAME_SHA256:

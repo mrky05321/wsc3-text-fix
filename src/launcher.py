@@ -10,6 +10,7 @@ import sys
 import time
 
 import psutil
+from safety_hold import require_runtime_approval
 
 from process_patch import (attach_game, process_list, CodeNotReady, GAME_SHA256,
                            sha_file, create_mutex, close)
@@ -40,6 +41,7 @@ def matching_games():
 
 
 def launch():
+    require_runtime_approval()
     if not GAME.is_file():
         raise RuntimeError('WSC3Launcher.exeを元のwsc3.exeと同じフォルダに置いてください。')
     if sha_file(GAME) != GAME_SHA256:

@@ -13,6 +13,8 @@ import zipfile
 ROOT=Path(__file__).resolve().parent
 sys.path.insert(0,str(ROOT/'src'))
 from hook_code import VERSION as HOOK_VERSION
+from safety_hold import require_runtime_approval
+require_runtime_approval()
 if sys.platform!='win32' or struct.calcsize('P')!=8:
     raise SystemExit('Build with 64-bit Python on Windows.')
 version=(ROOT/'VERSION').read_text(encoding='utf-8').strip()

@@ -14,6 +14,8 @@ import process_patch as p
 
 class LauncherTests(unittest.TestCase):
     def setUp(self):
+        approval=patch.object(l,'require_runtime_approval')
+        approval.start(); self.addCleanup(approval.stop)
         self.temp=tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
         self.home=Path(self.temp.name)
@@ -104,6 +106,10 @@ class LauncherTests(unittest.TestCase):
 
 
 class AttachTests(unittest.TestCase):
+    def setUp(self):
+        approval=patch.object(p,'require_runtime_approval')
+        approval.start(); self.addCleanup(approval.stop)
+
     def test_wrong_game_sha_never_opens_process(self):
         with patch.object(p.psutil,'Process') as proc, patch.object(p,'sha_file',return_value='wrong'), patch.object(p,'Process') as remote:
             proc.return_value.exe.return_value='C:/games/wsc3.exe'
