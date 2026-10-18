@@ -1,4 +1,4 @@
-"""Execute the unchanged v0.1.1 x86 hook against synthetic renderer memory."""
+"""Execute the correction-only x86 hook against synthetic renderer memory."""
 import struct
 import sys
 from pathlib import Path

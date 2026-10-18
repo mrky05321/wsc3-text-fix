@@ -1,7 +1,7 @@
 """Windows process backend. Only the verified game-code site is changed.
 
 Threads are suspended while installing/removing the jump, then resumed exactly
-once. Capturing and toggling mode never use a debugger or touch DRM code.
+once. Toggling mode never uses a debugger or touches DRM code.
 """
 from __future__ import annotations
 
@@ -19,8 +19,8 @@ import time
 import psutil
 
 from hook_code import (MAGIC, VERSION, HEADER_SIZE, CAPACITY, RECORD_SIZE, DATA_SIZE,
-                       MODE_OFFSET, COUNTER_OFFSET, ORIGINAL, SITE_RVA, VTABLE_RVA,
-                       build_hook, make_header, make_jump, decode_record)
+                       MODE_OFFSET, ORIGINAL, SITE_RVA, VTABLE_RVA,
+                       build_hook, make_header, make_jump)
 from journal_validation import load_recovery_journal
 
 K = C.WinDLL('kernel32', use_last_error=True)
@@ -325,7 +325,7 @@ class Session:
         self.vtable=vtable
         self.journal=Path(journal)
         self.code=0; self.data=0; self.code_bytes=b''
-        self.installed=False; self.last=0; self.lost=0
+        self.installed=False
         self.recovered=False
 
     def _save(self,state):
@@ -422,8 +422,6 @@ class Session:
         self.process.validate_allocation(self.data,DATA_SIZE,PAGE_RW)
         self._validate_remote()
         self.installed=True; self.recovered=True
-        # Previously exported records remain in the prior JSONL session.
-        self.last=struct.unpack_from('<I',self.process.read(self.data,HEADER_SIZE),COUNTER_OFFSET)[0]
         try:
             self._save('recovered')
         except OSError:
@@ -438,26 +436,7 @@ class Session:
             raise RuntimeError('モード変更の照合に失敗しました。')
 
     def poll(self):
-        if not self.process.alive:
-            return {'exited':True,'records':[]}
-        raw=self._validate_remote()
-        mode=struct.unpack_from('<I',raw,MODE_OFFSET)[0]
-        counter=struct.unpack_from('<I',raw,COUNTER_OFFSET)[0]
-        fixes=struct.unpack_from('<I',raw,40)[0]
-        if counter<self.last:
-            raise RuntimeError('計測カウンターの巻戻りを検出しました。接続し直してください。')
-        start=max(self.last+1,counter-CAPACITY+1)
-        self.lost+=max(0,start-(self.last+1))
-        rows=[]
-        self.last=start-1
-        for seq in range(start,counter+1):
-            address=self.data+HEADER_SIZE+((seq-1)&(CAPACITY-1))*RECORD_SIZE
-            record=decode_record(self.process.read(address,RECORD_SIZE),seq)
-            if record is None or struct.unpack('<I',self.process.read(address,4))[0]!=seq:
-                break  # incomplete writer: retry on the next poll
-            rows.append(record)
-            self.last=seq
-        return {'mode':mode,'total':counter,'fixes':fixes,'lost':self.lost,'records':rows,'exited':False}
+        raise RuntimeError('この版は記録機能を廃止しています。通常ランチャーを使用してください。')
 
     def detach(self):
         if not self.installed:
