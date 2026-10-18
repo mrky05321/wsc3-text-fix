@@ -20,6 +20,7 @@ import psutil
 from hook_code import (MAGIC, VERSION, HEADER_SIZE, CAPACITY, RECORD_SIZE, DATA_SIZE,
                        MODE_OFFSET, COUNTER_OFFSET, ORIGINAL, SITE_RVA, VTABLE_RVA,
                        build_hook, make_header, make_jump, decode_record)
+from journal_validation import load_recovery_journal
 
 K = C.WinDLL('kernel32', use_last_error=True)
 INVALID = C.c_void_p(-1).value
@@ -264,8 +265,16 @@ class Session:
                  'updated':time.time()}
         self.journal.parent.mkdir(parents=True,exist_ok=True)
         tmp=self.journal.with_suffix('.tmp')
-        tmp.write_text(json.dumps(payload,indent=2),encoding='utf-8')
-        os.replace(tmp,self.journal)
+        try:
+            tmp.write_text(json.dumps(payload,indent=2),encoding='utf-8')
+            os.replace(tmp,self.journal)
+        except Exception:
+            # Preserve the last valid journal and remove any incomplete temp.
+            try:
+                tmp.unlink(missing_ok=True)
+            except OSError:
+                pass
+            raise
 
     def _validate_remote(self):
         raw=self.process.read(self.data,HEADER_SIZE)
@@ -326,12 +335,12 @@ class Session:
             raise
 
     def _recover(self):
-        if not self.journal.exists():
-            raise RuntimeError('元の命令が一致しません。別の修正・別バージョンの可能性があります。')
-        j=json.loads(self.journal.read_text(encoding='utf-8'))
-        if j.get('pid')!=self.process.pid or abs(j.get('creation',0)-self.process.creation)>0.001 or j.get('site')!=self.site or j.get('vtable')!=self.vtable or j.get('original')!=ORIGINAL.hex():
-            raise RuntimeError('復元情報と現在のプロセスが一致しません。')
-        self.code=int(j['code']); self.data=int(j['data'])
+        j=load_recovery_journal(
+            self.journal, pid=self.process.pid, creation=self.process.creation,
+            site=self.site, vtable=self.vtable, original=ORIGINAL,
+            version=VERSION, data_size=DATA_SIZE,
+        )
+        self.code=j['code']; self.data=j['data']
         self.code_bytes=build_hook(self.code,self.data,self.site,self.vtable)
         if j.get('hook_sha256')!=hashlib.sha256(self.code_bytes).hexdigest():
             raise RuntimeError('復元情報の中継コードが一致しません。')
