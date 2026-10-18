@@ -13,6 +13,7 @@ import json
 import os
 from pathlib import Path
 import struct
+import tempfile
 import time
 
 import psutil
@@ -20,6 +21,7 @@ import psutil
 from hook_code import (MAGIC, VERSION, HEADER_SIZE, CAPACITY, RECORD_SIZE, DATA_SIZE,
                        MODE_OFFSET, COUNTER_OFFSET, ORIGINAL, SITE_RVA, VTABLE_RVA,
                        build_hook, make_header, make_jump, decode_record)
+from journal_validation import load_recovery_journal
 
 K = C.WinDLL('kernel32', use_last_error=True)
 INVALID = C.c_void_p(-1).value
@@ -50,6 +52,19 @@ wait_object = bind('WaitForSingleObject',W.DWORD,[W.HANDLE,W.DWORD])
 is_wow64 = bind('IsWow64Process',W.BOOL,[W.HANDLE,C.POINTER(W.BOOL)])
 create_mutex = bind('CreateMutexW',W.HANDLE,[C.c_void_p,W.BOOL,W.LPCWSTR])
 context_function = bind('Wow64GetThreadContext' if C.sizeof(C.c_void_p)==8 else 'GetThreadContext',W.BOOL,[W.HANDLE,C.c_void_p])
+query_memory = bind('VirtualQueryEx',C.c_size_t,[W.HANDLE,C.c_void_p,C.c_void_p,C.c_size_t])
+thread_owner = bind('GetProcessIdOfThread',W.DWORD,[W.HANDLE])
+thread_exit_code = bind('GetExitCodeThread',W.BOOL,[W.HANDLE,C.POINTER(W.DWORD)])
+
+
+class MemoryInfo(C.Structure):
+    _fields_=[('base',C.c_void_p),('allocation',C.c_void_p),('allocation_protect',W.DWORD),
+              ('size',C.c_size_t),('state',W.DWORD),('protect',W.DWORD),('type',W.DWORD)]
+
+
+def thread_exited(handle):
+    code=W.DWORD()
+    return bool(thread_exit_code(handle,C.byref(code))) and code.value!=259
 
 
 class ThreadEntry(C.Structure):
@@ -104,6 +119,8 @@ def thread_ids(pid):
             if e.owner==pid:
                 result.append(e.id)
             ok=thread_next(h,C.byref(e))
+        if C.get_last_error()!=18:
+            check(False,'Thread enumeration')
     finally:
         close(h)
     return result
@@ -153,7 +170,12 @@ class Process:
 
     @property
     def alive(self):
-        return bool(self.handle) and wait_object(self.handle,0)==0x102
+        if not self.handle:
+            return False
+        result=wait_object(self.handle,0)
+        if result not in (0,0x102):
+            check(False,'Process status')
+        return result==0x102
 
     def read(self,address,size):
         raw=C.create_string_buffer(size); count=C.c_size_t()
@@ -179,32 +201,70 @@ class Process:
     def free(self,address):
         check(free_memory(self.handle,address,0,0x8000),'VirtualFreeEx')
 
+    def validate_allocation(self,address,size,protection):
+        info=MemoryInfo()
+        check(query_memory(self.handle,address,C.byref(info),C.sizeof(info))==C.sizeof(info),'VirtualQueryEx')
+        if (info.base!=address or info.allocation!=address or info.size<size
+                or info.state!=0x1000 or info.type!=0x20000 or info.protect!=protection):
+            raise RuntimeError('復元先の専用メモリ領域が一致しません。ゲームを終了してください。')
+
     def protect(self,address,size,protection):
         old=W.DWORD()
         check(protect_memory(self.handle,address,size,protection,C.byref(old)),'VirtualProtectEx')
         return old.value
 
     def code_write(self,address,raw):
-        old=self.protect(address,len(raw),PAGE_RWX)
+        try:
+            before=self.read(address,len(raw))
+            old=self.protect(address,len(raw),PAGE_RWX)
+        except Exception as exc:
+            raise CodeWriteError(str(exc),rolled_back=True) from exc
         try:
             self.write(address,raw)
             check(flush_cache(self.handle,address,len(raw)),'FlushInstructionCache')
             if self.read(address,len(raw))!=raw:
                 raise RuntimeError('コードの書込後照合に失敗しました。')
-        finally:
             self.protect(address,len(raw),old)
+        except Exception as failure:
+            restored=False
+            try:
+                self.write(address,before)
+                check(flush_cache(self.handle,address,len(before)),'Rollback FlushInstructionCache')
+                restored=self.read(address,len(before))==before
+            except Exception:
+                pass
+            protection_restored=False
+            for _ in range(2):
+                try:
+                    self.protect(address,len(raw),old)
+                    protection_restored=True
+                    break
+                except Exception:
+                    pass
+            safe=restored and protection_restored
+            message=str(failure) if safe else '元の命令またはページ保護への復元を確認できません。ゲームを終了してください。'
+            raise CodeWriteError(message,rolled_back=safe) from failure
 
     @contextlib.contextmanager
     def frozen(self, forbidden=()):
         handles={}
         try:
             for _ in range(4):
+                for tid,h in list(handles.items()):
+                    if thread_exited(h):
+                        close(h)
+                        del handles[tid]
                 pending=set(thread_ids(self.pid))-set(handles)
                 if not pending:
+                    if not handles and self.alive:
+                        raise RuntimeError('対象スレッドを確認できません。変更を中止します。')
                     break
                 for tid in pending:
                     h=open_thread(0x2|0x8|0x40,False,tid)
                     check(h,f'OpenThread({tid})')
+                    if thread_owner(h)!=self.pid:
+                        close(h)
+                        raise RuntimeError('スレッド所有者が一致しません。変更を中止します。')
                     previous=suspend_thread(h)
                     if previous==0xFFFFFFFF:
                         close(h); check(False,f'SuspendThread({tid})')
@@ -212,6 +272,8 @@ class Process:
             else:
                 raise RuntimeError('スレッド一覧が変化したため変更を中止しました。')
             for tid,h in handles.items():
+                if thread_exited(h):
+                    continue
                 ctx=C.create_string_buffer(716)
                 struct.pack_into('<I',ctx,0,0x10001)
                 check(context_function(h,ctx),f'Thread context({tid})')
@@ -222,9 +284,13 @@ class Process:
         finally:
             failures=[]
             for tid,h in handles.items():
-                if resume_thread(h)==0xFFFFFFFF and self.alive:
-                    failures.append(tid)
-                close(h)
+                try:
+                    if not thread_exited(h) and resume_thread(h)==0xFFFFFFFF:
+                        if not thread_exited(h) and resume_thread(h)==0xFFFFFFFF:
+                            if not thread_exited(h):
+                                failures.append(tid)
+                finally:
+                    close(h)
             if failures:
                 raise RuntimeError(f'スレッド再開を確認できませんでした: {failures}')
 
@@ -246,6 +312,12 @@ class CodeNotReady(RuntimeError):
     pass
 
 
+class CodeWriteError(RuntimeError):
+    def __init__(self,message,*,rolled_back):
+        super().__init__(message)
+        self.rolled_back=rolled_back
+
+
 class Session:
     def __init__(self,process,site,vtable,journal):
         self.process=process
@@ -263,9 +335,21 @@ class Session:
                  'hook_sha256':hashlib.sha256(self.code_bytes).hexdigest(),
                  'updated':time.time()}
         self.journal.parent.mkdir(parents=True,exist_ok=True)
-        tmp=self.journal.with_suffix('.tmp')
-        tmp.write_text(json.dumps(payload,indent=2),encoding='utf-8')
-        os.replace(tmp,self.journal)
+        tmp=None
+        try:
+            with tempfile.NamedTemporaryFile(mode='w',encoding='utf-8',dir=self.journal.parent,
+                    prefix=self.journal.stem+'.',suffix='.tmp',delete=False) as stream:
+                tmp=Path(stream.name)
+                stream.write(json.dumps(payload,indent=2))
+                stream.flush()
+                os.fsync(stream.fileno())
+            os.replace(tmp,self.journal)
+        finally:
+            if tmp is not None:
+                try:
+                    tmp.unlink(missing_ok=True)
+                except OSError:
+                    pass
 
     def _validate_remote(self):
         raw=self.process.read(self.data,HEADER_SIZE)
@@ -282,6 +366,8 @@ class Session:
         return raw
 
     def install(self,mode=0):
+        if type(mode) is not int or mode not in (0,1):
+            raise ValueError('mode')
         if self.process.read(self.site,len(ORIGINAL))!=ORIGINAL:
             self._recover()
             self.set_mode(mode)
@@ -304,9 +390,9 @@ class Session:
                             # Conservatively retain allocations until rollback is verified.
                             self.installed=True
                             self.process.code_write(self.site,make_jump(self.site,self.code))
-                        except Exception:
-                            self.process.code_write(self.site,ORIGINAL)
-                            self.installed=False
+                        except CodeWriteError as exc:
+                            if exc.rolled_back:
+                                self.installed=False
                             raise
                     break
                 except BusySite:
@@ -326,15 +412,14 @@ class Session:
             raise
 
     def _recover(self):
-        if not self.journal.exists():
-            raise RuntimeError('元の命令が一致しません。別の修正・別バージョンの可能性があります。')
-        j=json.loads(self.journal.read_text(encoding='utf-8'))
-        if j.get('pid')!=self.process.pid or abs(j.get('creation',0)-self.process.creation)>0.001 or j.get('site')!=self.site or j.get('vtable')!=self.vtable or j.get('original')!=ORIGINAL.hex():
-            raise RuntimeError('復元情報と現在のプロセスが一致しません。')
-        self.code=int(j['code']); self.data=int(j['data'])
+        j=load_recovery_journal(self.journal,pid=self.process.pid,creation=self.process.creation,
+                site=self.site,vtable=self.vtable,original=ORIGINAL,version=VERSION,data_size=DATA_SIZE)
+        self.code=j['code']; self.data=j['data']
         self.code_bytes=build_hook(self.code,self.data,self.site,self.vtable)
         if j.get('hook_sha256')!=hashlib.sha256(self.code_bytes).hexdigest():
             raise RuntimeError('復元情報の中継コードが一致しません。')
+        self.process.validate_allocation(self.code,4096,PAGE_RX)
+        self.process.validate_allocation(self.data,DATA_SIZE,PAGE_RW)
         self._validate_remote()
         self.installed=True; self.recovered=True
         # Previously exported records remain in the prior JSONL session.
@@ -345,7 +430,7 @@ class Session:
             pass  # Keep using the validated existing recovery journal.
 
     def set_mode(self,mode):
-        if mode not in (0,1):
+        if type(mode) is not int or mode not in (0,1):
             raise ValueError('mode')
         self._validate_remote()
         self.process.write(self.data+MODE_OFFSET,struct.pack('<I',mode))
@@ -379,8 +464,11 @@ class Session:
             self.process.close(); return
         if not self.process.alive:
             self.installed=False
-            self._save('process_exited')
-            self.process.close(); return
+            try:
+                self._save('process_exited')
+            finally:
+                self.process.close()
+            return
         self._validate_remote()
         for attempt in range(50):
             try:
@@ -393,10 +481,12 @@ class Session:
                 if attempt==49:
                     raise
                 time.sleep(0.01)
-        self.process.free(self.code)
-        self.process.free(self.data)
-        self._save('detached')
-        self.process.close()
+        try:
+            self.process.free(self.code)
+            self.process.free(self.data)
+            self._save('detached')
+        finally:
+            self.process.close()
 
 
 def attach_game(pid,log_dir,mode=0):

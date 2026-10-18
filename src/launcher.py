@@ -113,21 +113,33 @@ def main():
     except Exception as exc:
         notify(str(exc) + '\n\n元のwsc3.exeファイルは変更していません。')
     finally:
-        if session:
-            try:
-                session.detach()
+        try:
+            if session:
                 try:
-                    session.journal.unlink(missing_ok=True)
-                except OSError:
-                    pass
-            except Exception as exc:
-                if session.process.alive:
-                    notify('元の命令への復元を確認できませんでした。ゲームを終了してください。\nゲーム終了までランチャーは待機します。\n' + str(exc))
-                    while session.process.alive:
-                        time.sleep(0.5)
-                session.process.close()
-        if mutex:
-            close(mutex)
+                    session.detach()
+                    try:
+                        session.journal.unlink(missing_ok=True)
+                    except OSError:
+                        pass
+                except Exception as exc:
+                    try:
+                        alive=session.process.alive
+                    except OSError:
+                        alive=None  # Unknown status must never mean exited.
+                    try:
+                        if alive is not False:
+                            notify('元の命令への復元を確認できませんでした。ゲームを終了してください。\n' + str(exc))
+                        while alive:
+                            time.sleep(0.5)
+                            try:
+                                alive=session.process.alive
+                            except OSError:
+                                break
+                    finally:
+                        session.process.close()
+        finally:
+            if mutex:
+                close(mutex)
 
 
 if __name__ == '__main__':

@@ -25,6 +25,12 @@ jobs:
           architecture: x64
       - name: Install build dependencies
         run: python -m pip install -r requirements-build.txt
+      - name: Install test dependencies
+        run: python -m pip install -r requirements-test.txt
+      - name: Test before packaging or release
+        run: python -m unittest discover -s tests -v
+        env:
+          WSC3_RUN_FIXTURE: '1'
       - name: Build executable and ZIP
         run: python build.py
       - name: Create release
@@ -40,7 +46,7 @@ jobs:
           $notes = @"
           鋼鉄の咆哮3 Windows版の文章折り返しを補正する非公式ランチャーです。
 
-          v0.1.3ではv0.1.1の改行補正を復旧し、表示されて応答するゲーム画面を確認してから接続するよう変更しました。更新前にゲームと旧ランチャーを終了してください。実ゲームでの起動・表示はこのビルドでは未確認です。
+          v0.1.4では、起動と改行補正の改善報告があるv0.1.3を基準に、復元情報の検査と失敗時の復旧処理を補強しました。描画フックと起動待ち条件は変更していません。更新前にゲームと旧ランチャーを終了してください。同じソースのローカル配布EXEは2026-10-18にユーザーが正常動作を確認しています。このCI生成EXE自体の実ゲームでの確認は未実施です。
 
           ZIPには WSC3Launcher.exe だけが入っています。元の wsc3.exe と同じフォルダへ置き、ランチャーから起動してください。依存ライブラリのライセンスはEXEに同梱しています。
 
