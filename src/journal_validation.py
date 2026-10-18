@@ -26,7 +26,7 @@ def load_recovery_journal(
         if len(raw) > MAX_JOURNAL_BYTES:
             raise ValueError("Recovery journal exceeds the size limit")
         journal = json.loads(raw.decode("utf-8"))
-    except (OSError, ValueError, UnicodeError) as exc:
+    except (OSError, ValueError, UnicodeError, RecursionError) as exc:
         raise RuntimeError("復元情報が読めないか破損しています。変更を中止します。") from exc
 
     if not isinstance(journal, dict):
@@ -36,6 +36,7 @@ def load_recovery_journal(
             raise RuntimeError(f"復元情報の {field} が不正です。")
     recorded_creation = journal.get("creation")
     if (type(recorded_creation) not in (int, float)
+            or recorded_creation <= 0 or recorded_creation > 1e12
             or not math.isfinite(recorded_creation)):
         raise RuntimeError("復元情報の作成時刻が不正です。")
     if (journal["version"] != version or journal["pid"] != pid
@@ -46,8 +47,10 @@ def load_recovery_journal(
         raise RuntimeError("復元情報と現在のプロセスが一致しません。")
 
     code, data = journal["code"], journal["data"]
+    if type(journal.get('capture')) is not bool:
+        raise RuntimeError('復元情報の記録設定が不正です。')
     for address, size in ((code, code_capacity), (data, data_size)):
-        if not (MIN_USER_ADDRESS <= address and address + size < MAX_HOOK_ADDRESS):
+        if not (MIN_USER_ADDRESS <= address and address + size < MAX_HOOK_ADDRESS) or address % 4096:
             raise RuntimeError("復元情報のメモリアドレスが範囲外です。")
     if code < data + data_size and data < code + code_capacity:
         raise RuntimeError("復元情報の中継領域が重複しています。")

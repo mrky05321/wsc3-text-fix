@@ -51,6 +51,13 @@ wait_object = bind('WaitForSingleObject',W.DWORD,[W.HANDLE,W.DWORD])
 is_wow64 = bind('IsWow64Process',W.BOOL,[W.HANDLE,C.POINTER(W.BOOL)])
 create_mutex = bind('CreateMutexW',W.HANDLE,[C.c_void_p,W.BOOL,W.LPCWSTR])
 context_function = bind('Wow64GetThreadContext' if C.sizeof(C.c_void_p)==8 else 'GetThreadContext',W.BOOL,[W.HANDLE,C.c_void_p])
+thread_owner = bind('GetProcessIdOfThread',W.DWORD,[W.HANDLE])
+query_memory = bind('VirtualQueryEx',C.c_size_t,[W.HANDLE,C.c_void_p,C.c_void_p,C.c_size_t])
+
+
+class MemoryInfo(C.Structure):
+    _fields_=[('base',C.c_void_p),('allocation',C.c_void_p),('allocation_protect',W.DWORD),
+              ('size',C.c_size_t),('state',W.DWORD),('protect',W.DWORD),('type',W.DWORD)]
 
 
 class ThreadEntry(C.Structure):
@@ -105,6 +112,8 @@ def thread_ids(pid):
             if e.owner==pid:
                 result.append(e.id)
             ok=thread_next(h,C.byref(e))
+        if C.get_last_error()!=18:  # ERROR_NO_MORE_FILES, not a failed snapshot
+            check(False,'Thread enumeration')
     finally:
         close(h)
     return result
@@ -180,6 +189,14 @@ class Process:
     def free(self,address):
         check(free_memory(self.handle,address,0,0x8000),'VirtualFreeEx')
 
+    def validate_allocation(self,address,size,protection):
+        info=MemoryInfo()
+        result=query_memory(self.handle,address,C.byref(info),C.sizeof(info))
+        check(result==C.sizeof(info),'VirtualQueryEx')
+        if (info.base!=address or info.allocation!=address or info.size<size
+                or info.state!=0x1000 or info.type!=0x20000 or info.protect!=protection):
+            raise RuntimeError('復元先の専用メモリ領域が一致しません。ゲームを終了してください。')
+
     def protect(self,address,size,protection):
         old=W.DWORD()
         check(protect_memory(self.handle,address,size,protection,C.byref(old)),'VirtualProtectEx')
@@ -191,37 +208,60 @@ class Process:
         before=self.read(address,len(raw))
         old=self.protect(address,len(raw),PAGE_RWX)
         try:
-            try:
-                self.write(address,raw)
-                check(flush_cache(self.handle,address,len(raw)),'FlushInstructionCache')
-                if self.read(address,len(raw))!=raw:
-                    raise RuntimeError('コードの書込後照合に失敗しました。')
-            except Exception:
-                try:
-                    self.write(address,before)
-                    check(flush_cache(self.handle,address,len(before)),'Rollback FlushInstructionCache')
-                    if self.read(address,len(before))!=before:
-                        raise RuntimeError('元のコードへの復元後照合に失敗しました。')
-                except Exception as rollback_error:
-                    raise RuntimeError(
-                        'コードの書込に失敗し、元の命令への復元を確認できません。'
-                        '対象ゲームを終了してください。'
-                    ) from rollback_error
-                raise
-        finally:
+            self.write(address,raw)
+            check(flush_cache(self.handle,address,len(raw)),'FlushInstructionCache')
+            if self.read(address,len(raw))!=raw:
+                raise RuntimeError('コードの書込後照合に失敗しました。')
             self.protect(address,len(raw),old)
+        except Exception as failure:
+            restored=False
+            try:
+                # A failed VirtualProtectEx leaves protection unchanged, so
+                # the page is still RWX here. Keep the ORIGINAL protection
+                # for cleanup; never adopt RWX as the original state.
+                self.write(address,before)
+                check(flush_cache(self.handle,address,len(before)),'Rollback FlushInstructionCache')
+                if self.read(address,len(before))!=before:
+                    raise RuntimeError('元のコードへの復元後照合に失敗しました。')
+                restored=True
+            except Exception:
+                pass
+            protection_restored=False
+            for _ in range(2):
+                try:
+                    self.protect(address,len(raw),old)
+                    protection_restored=True
+                    break
+                except Exception:
+                    pass
+            if restored and protection_restored:
+                raise CodeWriteError(str(failure), rolled_back=True) from failure
+            raise CodeWriteError(
+                '元の命令またはページ保護への復元を確認できません。対象ゲームを終了してください。',
+                rolled_back=False) from failure
 
     @contextlib.contextmanager
     def frozen(self, forbidden=()):
         handles={}
         try:
             for _ in range(4):
+                for tid,h in list(handles.items()):
+                    if wait_object(h,0)==0:
+                        close(h)
+                        del handles[tid]
                 pending=set(thread_ids(self.pid))-set(handles)
                 if not pending:
+                    if not handles and self.alive:
+                        raise RuntimeError('対象スレッドを確認できません。変更を中止します。')
                     break
                 for tid in pending:
-                    h=open_thread(0x2|0x8|0x40,False,tid)
+                    h=open_thread(0x2|0x8|0x40|0x100000,False,tid)
+                    if not h and C.get_last_error()==87:
+                        continue  # Thread exited before OpenThread.
                     check(h,f'OpenThread({tid})')
+                    if thread_owner(h)!=self.pid:
+                        close(h)
+                        raise RuntimeError('スレッド所有者が変化しました。変更を中止します。')
                     previous=suspend_thread(h)
                     if previous==0xFFFFFFFF:
                         close(h); check(False,f'SuspendThread({tid})')
@@ -229,6 +269,8 @@ class Process:
             else:
                 raise RuntimeError('スレッド一覧が変化したため変更を中止しました。')
             for tid,h in handles.items():
+                if wait_object(h,0)==0:
+                    continue  # Terminated threads need no context or resume.
                 ctx=C.create_string_buffer(716)
                 struct.pack_into('<I',ctx,0,0x10001)
                 check(context_function(h,ctx),f'Thread context({tid})')
@@ -239,9 +281,16 @@ class Process:
         finally:
             failures=[]
             for tid,h in handles.items():
-                if resume_thread(h)==0xFFFFFFFF and self.alive:
-                    failures.append(tid)
-                close(h)
+                try:
+                    if wait_object(h,0)!=0:
+                        # Retry only after a failed ResumeThread (which did not
+                        # decrement the count); never double-resume success.
+                        if resume_thread(h)==0xFFFFFFFF:
+                            if wait_object(h,0)!=0 and resume_thread(h)==0xFFFFFFFF:
+                                if self.alive and wait_object(h,0)!=0:
+                                    failures.append(tid)
+                finally:
+                    close(h)
             if failures:
                 raise RuntimeError(f'スレッド再開を確認できませんでした: {failures}')
 
@@ -263,8 +312,14 @@ class CodeNotReady(RuntimeError):
     pass
 
 
+class CodeWriteError(RuntimeError):
+    def __init__(self,message,*,rolled_back):
+        super().__init__(message)
+        self.rolled_back=rolled_back
+
+
 class Session:
-    def __init__(self,process,site,vtable,journal):
+    def __init__(self,process,site,vtable,journal,capture=True):
         self.process=process
         self.site=site
         self.vtable=vtable
@@ -272,17 +327,22 @@ class Session:
         self.code=0; self.data=0; self.code_bytes=b''
         self.installed=False; self.last=0; self.lost=0
         self.recovered=False
+        self.capture=capture
 
     def _save(self,state):
         payload={'version':VERSION,'state':state,'pid':self.process.pid,
                  'creation':self.process.creation,'site':self.site,'vtable':self.vtable,
                  'code':self.code,'data':self.data,'original':ORIGINAL.hex(),
                  'hook_sha256':hashlib.sha256(self.code_bytes).hexdigest(),
+                 'capture':self.capture,
                  'updated':time.time()}
         self.journal.parent.mkdir(parents=True,exist_ok=True)
         tmp=self.journal.with_suffix('.tmp')
         try:
-            tmp.write_text(json.dumps(payload,indent=2),encoding='utf-8')
+            with tmp.open('w',encoding='utf-8') as stream:
+                stream.write(json.dumps(payload,indent=2))
+                stream.flush()
+                os.fsync(stream.fileno())
             os.replace(tmp,self.journal)
         except Exception:
             # Preserve the last valid journal and remove any incomplete temp.
@@ -298,7 +358,8 @@ class Session:
             raise RuntimeError('計測領域の識別子が一致しません。')
         version,mode,replacement,capacity=struct.unpack_from('<4I',raw,16)
         stride,site,code=struct.unpack_from('<3I',raw,44)
-        if (version,replacement,capacity,stride,site,code)!=(VERSION,13,CAPACITY,RECORD_SIZE,self.site,self.code) or mode not in (0,1):
+        capture=struct.unpack_from('<I',raw,60)[0]
+        if (version,replacement,capacity,stride,site,code)!=(VERSION,13,CAPACITY,RECORD_SIZE,self.site,self.code) or mode not in (0,1) or capture!=int(self.capture):
             raise RuntimeError('計測領域の構成が一致しません。')
         if self.process.read(self.code,len(self.code_bytes))!=self.code_bytes:
             raise RuntimeError('中継コードが変更されています。操作を中止します。')
@@ -307,6 +368,8 @@ class Session:
         return raw
 
     def install(self,mode=0):
+        if type(mode) is not int or mode not in (0,1):
+            raise ValueError('mode')
         if self.process.read(self.site,len(ORIGINAL))!=ORIGINAL:
             self._recover()
             self.set_mode(mode)
@@ -314,8 +377,8 @@ class Session:
         self.data=self.process.alloc(DATA_SIZE)
         try:
             self.code=self.process.alloc(4096)
-            self.code_bytes=build_hook(self.code,self.data,self.site,self.vtable)
-            self.process.write(self.data,make_header(self.site,self.code,mode))
+            self.code_bytes=build_hook(self.code,self.data,self.site,self.vtable,capture=self.capture)
+            self.process.write(self.data,make_header(self.site,self.code,mode,capture=self.capture))
             self.process.write(self.code,self.code_bytes)
             self.process.protect(self.code,4096,PAGE_RX)
             check(flush_cache(self.process.handle,self.code,len(self.code_bytes)),'FlushInstructionCache')
@@ -329,9 +392,9 @@ class Session:
                             # Conservatively retain allocations until rollback is verified.
                             self.installed=True
                             self.process.code_write(self.site,make_jump(self.site,self.code))
-                        except Exception:
-                            self.process.code_write(self.site,ORIGINAL)
-                            self.installed=False
+                        except CodeWriteError as exc:
+                            if exc.rolled_back:
+                                self.installed=False
                             raise
                     break
                 except BusySite:
@@ -356,10 +419,14 @@ class Session:
             site=self.site, vtable=self.vtable, original=ORIGINAL,
             version=VERSION, data_size=DATA_SIZE,
         )
+        if j['capture']!=self.capture:
+            raise RuntimeError('復元情報の記録設定が一致しません。同じ版・設定で再接続するかゲームを終了してください。')
         self.code=j['code']; self.data=j['data']
-        self.code_bytes=build_hook(self.code,self.data,self.site,self.vtable)
+        self.code_bytes=build_hook(self.code,self.data,self.site,self.vtable,capture=self.capture)
         if j.get('hook_sha256')!=hashlib.sha256(self.code_bytes).hexdigest():
             raise RuntimeError('復元情報の中継コードが一致しません。')
+        self.process.validate_allocation(self.code,4096,PAGE_RX)
+        self.process.validate_allocation(self.data,DATA_SIZE,PAGE_RW)
         self._validate_remote()
         self.installed=True; self.recovered=True
         # Previously exported records remain in the prior JSONL session.
@@ -370,7 +437,7 @@ class Session:
             pass  # Keep using the validated existing recovery journal.
 
     def set_mode(self,mode):
-        if mode not in (0,1):
+        if type(mode) is not int or mode not in (0,1):
             raise ValueError('mode')
         self._validate_remote()
         self.process.write(self.data+MODE_OFFSET,struct.pack('<I',mode))
@@ -378,6 +445,14 @@ class Session:
             raise RuntimeError('モード変更の照合に失敗しました。')
 
     def poll(self):
+        # Keep writers stopped for the whole snapshot: a commit re-read alone
+        # cannot exclude an overwrite that begins during ReadProcessMemory.
+        if not self.process.alive:
+            return {'exited':True,'records':[]}
+        with self.process.frozen():
+            return self._poll_frozen()
+
+    def _poll_frozen(self):
         if not self.process.alive:
             return {'exited':True,'records':[]}
         raw=self._validate_remote()
@@ -404,8 +479,11 @@ class Session:
             self.process.close(); return
         if not self.process.alive:
             self.installed=False
-            self._save('process_exited')
-            self.process.close(); return
+            try:
+                self._save('process_exited')
+            finally:
+                self.process.close()
+            return
         self._validate_remote()
         for attempt in range(50):
             try:
@@ -424,7 +502,7 @@ class Session:
         self.process.close()
 
 
-def attach_game(pid,log_dir,mode=0):
+def attach_game(pid,log_dir,mode=0,*,capture=True):
     proc=psutil.Process(pid)
     path=proc.exe()
     if Path(path).name.lower()!='wsc3.exe' or sha_file(path)!=GAME_SHA256:
@@ -434,7 +512,7 @@ def attach_game(pid,log_dir,mode=0):
         raise RuntimeError('想定したWSC3のモジュール配置と一致しません。')
     process=Process(pid)
     session=Session(process,base+SITE_RVA,base+VTABLE_RVA,
-                    Path(log_dir)/f'hook_{pid}_{int(process.creation*1000)}.json')
+                    Path(log_dir)/f'hook_{pid}_{int(process.creation*1000)}.json',capture=capture)
     try:
         if process.read(0x49B1F0,10)!=bytes.fromhex('81ec9809000053558be9') or process.read(0x49B28B,7)!=bytes.fromhex('8bbc24b8090000'):
             raise CodeNotReady('描画コードの展開待ちです。ゲームの起動を続けてください。')

@@ -8,7 +8,7 @@ from __future__ import annotations
 import struct
 
 MAGIC = b'WSC3WRAP20261015'
-VERSION = 3
+VERSION = 4
 HEADER_SIZE = 64
 CAPACITY = 128
 RECORD_SIZE = 256
@@ -53,21 +53,35 @@ class Assembler:
         return bytes(self.code)
 
 
-def make_header(site, code_address, mode=0):
+def make_header(site, code_address, mode=0, *, capture=True):
+    if type(mode) is not int or mode not in (0,1) or type(capture) is not bool:
+        raise ValueError('mode/capture')
     raw = bytearray(HEADER_SIZE)
     raw[:16] = MAGIC
     struct.pack_into('<12I',raw,16,VERSION,mode,REPLACEMENT,CAPACITY,0,0,0,
-                     RECORD_SIZE,site,code_address,0,0)
+                     RECORD_SIZE,site,code_address,0,int(capture))
     return bytes(raw)
 
 
-def build_hook(address, data, site, vtable):
+def build_hook(address, data, site, vtable, *, capture=True):
     a = Assembler()
     a.emit(ORIGINAL)                         # original MOV, before changing ESP
     a.emit('9c60')                           # PUSHFD; PUSHAD, 36 bytes
     a.emit('817d00'); a.u32(vtable); a.jne('done')
     a.emit('8d85440d0000')                   # output buffer must be this+D44
     a.emit('39853c050000'); a.jne('done')
+
+    if not capture:
+        _emit_fix_only(a,data)
+        a.label('done')
+        a.emit('619d')
+        a.emit('e9')
+        a.u32((site+len(ORIGINAL))-(address+len(a.code)+4))
+        return a.finish()
+
+    # Failed try-lock skips telemetry, while preserving the width policy.
+    a.emit('b8010000008705'); a.u32(data+56)
+    a.emit('85c0'); a.jne('fix_only')
 
     a.emit('b801000000f00fc105'); a.u32(data+COUNTER_OFFSET)
     a.emit('8d7001')                         # ESI=sequence, counter+1
@@ -96,15 +110,27 @@ def build_hook(address, data, site, vtable):
     a.emit('64a124000000894728')              # TEB32 thread ID, no API call
     a.emit('8b842494000000894730')            # original ESP+70: metrics height
     a.emit('8b8424a8000000894734')            # original ESP+84: average width
-    a.emit('8db5440d00005783c740b920000000fcf3a55f')  # prefix128, DF saved
+    # No text-prefix copy: 128 readable bytes have not been established.
     for source,dest in [(0x418,192),(0x41C,196),(0x46C,200)]:
         a.emit('8b85'); a.u32(source); a.emit('8987'); a.u32(dest)
     a.emit('8b473c8907')                     # commit seq LAST
+    a.emit('c705'); a.u32(data+56); a.u32(0)  # release AFTER commit
+    a.jump('done')
+    a.label('fix_only')
+    _emit_fix_only(a,data)
     a.label('done')
     a.emit('619d')                           # POPAD; POPFD
     a.emit('e9')
     a.u32((site+len(ORIGINAL))-(address+len(a.code)+4))
     return a.finish()
+
+
+def _emit_fix_only(a,data):
+    a.emit('833d'); a.u32(data+MODE_OFFSET); a.emit('01'); a.jne('done')
+    a.emit('8b95640400008d4aff81f9ff010000')
+    a.emit('0f87'); a.refs.append((len(a.code),'done')); a.u32(0)
+    a.emit('8d0c123b4c2418'); a.jne('done')
+    a.emit('8d420189442418')
 
 
 def make_jump(site, destination):

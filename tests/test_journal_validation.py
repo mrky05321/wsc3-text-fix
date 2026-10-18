@@ -28,6 +28,7 @@ class RecoveryJournalTests(unittest.TestCase):
             "site": self.site, "vtable": self.vtable,
             "code": 0x10000000, "data": 0x11000000,
             "original": ORIGINAL.hex(), "hook_sha256": "a" * 64,
+            "capture": True,
         }
 
     def write(self, record=None):
@@ -50,7 +51,8 @@ class RecoveryJournalTests(unittest.TestCase):
     def test_missing_and_corrupt_journals(self):
         with self.assertRaises(RuntimeError):
             self.load()
-        for payload in (b"not-json", b"{", b"\xff", b" " * (MAX_JOURNAL_BYTES + 1)):
+        for payload in (b"not-json", b"{", b"\xff", b"["*1500+b"]"*1500,
+                        b" " * (MAX_JOURNAL_BYTES + 1)):
             with self.subTest(length=len(payload)):
                 self.path.write_bytes(payload)
                 with self.assertRaises(RuntimeError):
@@ -79,6 +81,7 @@ class RecoveryJournalTests(unittest.TestCase):
             {"pid": True}, {"pid": "1234"}, {"code": "0x10000000"},
             {"creation": None}, {"creation": "1000.125"}, {"creation": float("nan")},
             {"creation": float("inf")},
+            {"creation": 10**1000}, {"capture": 1}, {"capture": None},
         )
         for change in variations:
             with self.subTest(change=change):
@@ -89,6 +92,7 @@ class RecoveryJournalTests(unittest.TestCase):
     def test_unsafe_addresses_rejected(self):
         changes = (
             {"code": 0}, {"data": -1},
+            {"code": 0x10000001},
             {"code": 0x7FFFFFF0},
             {"data": 0x7FFFFFF0},
             {"data": 0x10000010},

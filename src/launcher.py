@@ -1,4 +1,4 @@
-"""Windowless game launcher using the already deployed version 3 correction."""
+"""Windowless game launcher with correction only (no text/metric capture)."""
 from __future__ import annotations
 
 import ctypes as C
@@ -61,7 +61,7 @@ def launch():
             absent_since = None
             pid = candidates[0]['pid']
             try:
-                return attach_game(pid, STATE_DIR, 1)
+                return attach_game(pid, STATE_DIR, 1, capture=False)
             except CodeNotReady:
                 pass
             except psutil.NoSuchProcess:
